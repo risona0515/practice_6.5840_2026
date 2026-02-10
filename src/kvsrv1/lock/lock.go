@@ -2,6 +2,8 @@ package lock
 
 import (
 	"log"
+	"strconv"
+	"sync"
 	"time"
 
 	"6.5840/kvsrv1/rpc"
@@ -15,11 +17,21 @@ type Lock struct {
 	// MakeLock().
 	ck kvtest.IKVClerk
 	// You may add code here
-	lockname    string
-	lockversion rpc.Tversion
+	lockname string
+	lockid   int
+	// lockversion rpc.Tversion
 }
 
-// var LockMap map[string]*Lock
+// 用于分配id
+type lockIdDistributor struct {
+	mu     sync.Mutex
+	nextid map[string]int
+}
+
+var d = lockIdDistributor{nextid: map[string]int{}}
+
+// var mu sync.Mutex
+// var nextid = make(map[string]int)
 
 // The tester calls MakeLock() and passes in a k/v clerk; your code can
 // perform a Put or Get by calling lk.ck.Put() or lk.ck.Get().
@@ -30,14 +42,23 @@ type Lock struct {
 func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
 	lk := &Lock{ck: ck, lockname: lockname}
 	// You may add code here
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	id, ok := d.nextid[lockname]
+	if !ok {
+		lk.lockid = 1
+		d.nextid[lockname] = 2
+	} else {
+		lk.lockid = id
+		d.nextid[lockname]++
+	}
+
 	return lk
 }
 
 func (lk *Lock) Acquire() {
 	// Your code here
-	cnt := 0
 	for true {
-		cnt++
 		value, version, err := lk.ck.Get(lk.lockname)
 		// if cnt%100 == 2 {
 		// 	log.Printf("acquire lock, k %v, v %v, version %v, err %v", lk.lockname, value, version, err)
@@ -45,41 +66,36 @@ func (lk *Lock) Acquire() {
 
 		if err == rpc.ErrNoKey {
 			version = 0
-			err = lk.ck.Put(lk.lockname, "lock", version)
+			err = lk.ck.Put(lk.lockname, strconv.Itoa(lk.lockid), version)
 			if err == rpc.OK {
-				lk.lockversion = version
 				return
 			}
-		} else if value == "unlock" {
-			err = lk.ck.Put(lk.lockname, "lock", version)
-			// if err != rpc.OK {
-			// 	log.Printf()
-			// }
+		} else if value == "0" {
+			err = lk.ck.Put(lk.lockname, strconv.Itoa(lk.lockid), version)
 			if err == rpc.OK {
-				lk.lockversion = version
 				return
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		if err == rpc.ErrMaybe {
+			value, version, err = lk.ck.Get(lk.lockname)
+			if value == strconv.Itoa(lk.lockid) {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (lk *Lock) Release() {
 	// Your code here
-	value, version, err := lk.ck.Get((lk.lockname))
-	if err == rpc.ErrNoKey {
-		log.Printf("lockname %v tried to unlock but no lock exists", lk.lockname)
+	value, version, _ := lk.ck.Get((lk.lockname))
+	if value != strconv.Itoa(lk.lockid) {
+		log.Printf("lock release or occupied by others %v", value)
 	}
-	if value == "unlock" {
-		log.Printf("lockname %v tried to unlock but already unlocked, stored version %v, get version %v", lk.lockname, lk.lockversion, version)
-		return
-	}
-	if version != lk.lockversion+1 {
-		log.Printf("lockname %v tried to unlock but version not match, stored version %v, get version %v", lk.lockname, lk.lockversion, version)
-		return
-	}
-	err = lk.ck.Put(lk.lockname, "unlock", version)
-	if err != rpc.OK {
-		log.Printf("lockname %v unlock failed, stored version %v, get version %v, err %v", lk.lockname, lk.lockversion, version, err)
-	}
+	// err = lk.ck.Put(lk.lockname, "0", version)
+	lk.ck.Put(lk.lockname, "0", version)
+	// if err == rpc.ErrMaybe {
+	// 	value, version, err = lk.ck.Get((lk.lockname))
+
+	// }
 }
