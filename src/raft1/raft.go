@@ -153,14 +153,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.curLeader = args.LeaderID
-		rf.currentTerm = args.Term
+	// if args.Term > rf.currentTerm {
+	// rf.curLeader = args.LeaderID
+	rf.currentTerm = args.Term
 
-		reply.Success = true
-		reply.Term = rf.currentTerm
-		// return
-	}
+	reply.Success = true
+	reply.Term = rf.currentTerm
+	// return
+	// }
 	// 有没有可能同term但多个server发来了append entries？
 	// if args.LeaderID != rf.curLeader {
 	// 	reply.Success = false
@@ -318,16 +318,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term == rf.currentTerm {
 		if args.CandidateId == rf.votedFor {
 			reply.VoteGranted = true
+			// log.Printf("%v grant %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
 		} else {
 			reply.VoteGranted = false
-			// log.Printf("%v reject %v request vote, voted for %v", rf.me, args.CandidateId, rf.votedFor)
+			// log.Printf("%v reject %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
 		}
 		return
 	}
 
 	latestlog := rf.logs[len(rf.logs)-1]
 	if latestlog.index <= args.LastLogIndex && latestlog.term <= args.LastLogTerm {
+		// log.Printf("%v grant %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+		// log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
+
 		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
+		rf.curLeader = args.CandidateId
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 	} else {
