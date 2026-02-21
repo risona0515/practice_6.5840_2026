@@ -10,6 +10,7 @@ package raft
 import (
 	//	"bytes"
 	"context"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -168,6 +169,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 如果一个新的同term的append entries与自己的leader不一样，更新？
 	rf.leaderAlive = true
 	rf.curLeader = args.LeaderID
+	rf.persist()
 	if args.Entries == nil { // keep alive heartbeat
 		// rf.leaderAlive = true
 		return
@@ -224,6 +226,8 @@ func (rf *Raft) keepalive() {
 				if !hasNewLeader.Load() && replies[i].Term > rf.currentTerm {
 					hasNewLeader.Store(true)
 					rf.curLeader = i
+					rf.currentTerm = replies[i].Term
+					rf.persist()
 					return
 				}
 				return
@@ -309,39 +313,66 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
+	// reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		// log.Printf("%v reject %v request vote, args term %v, cur term %v", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		return
 	}
-	if args.Term == rf.currentTerm {
-		if args.CandidateId == rf.votedFor {
-			reply.VoteGranted = true
-			// log.Printf("%v grant %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
-		} else {
-			reply.VoteGranted = false
-			// log.Printf("%v reject %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
-		}
-		return
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.curLeader = -1
 	}
 
-	latestlog := rf.logs[len(rf.logs)-1]
-	if latestlog.index <= args.LastLogIndex && latestlog.term <= args.LastLogTerm {
-		// log.Printf("%v grant %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-		// log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
+	canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
+	lastLog := rf.logs[len(rf.logs)-1]
+	upToData := args.LastLogTerm > lastLog.term ||
+		(args.LastLogTerm == lastLog.term && args.LastLogIndex >= lastLog.index)
 
+	if canVote && upToData {
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
 		rf.curLeader = args.CandidateId
 		reply.VoteGranted = true
-		reply.Term = rf.currentTerm
+		rf.leaderAlive = true
+		log.Printf("%v grant %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
 	} else {
-
-		// log.Printf("%v rrreject %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-		// log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
 		reply.VoteGranted = false
 	}
+	rf.persist()
+	// if args.Term == rf.currentTerm {
+	// 	if args.CandidateId == rf.votedFor || rf.votedFor == math.MaxInt32 {
+	// 		rf.votedFor = args.CandidateId
+	// 		reply.VoteGranted = true
+	// 		log.Printf("%v grant %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
+	// 	} else {
+	// 		reply.VoteGranted = false
+	// 		log.Printf("%v reject %v request vote, voted for %v, term %v", rf.me, args.CandidateId, rf.votedFor, rf.currentTerm)
+	// 	}
+	// 	return
+	// }
+
+	// rf.currentTerm = args.Term
+	// rf.votedFor = math.MaxInt32
+
+	// latestlog := rf.logs[len(rf.logs)-1]
+	// if latestlog.index <= args.LastLogIndex && latestlog.term <= args.LastLogTerm {
+	// 	log.Printf("%v grant %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+	// 	log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
+
+	// 	rf.votedFor = args.CandidateId
+	// 	// rf.currentTerm = args.Term
+	// 	rf.curLeader = args.CandidateId
+	// 	reply.VoteGranted = true
+	// 	reply.Term = rf.currentTerm
+	// } else {
+
+	// 	log.Printf("%v rrreject %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+	// 	log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
+	// 	reply.VoteGranted = false
+	// }
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -408,6 +439,8 @@ func (rf *Raft) checkTimeoutAndVoteSelf() {
 	}
 
 	rf.currentTerm++ // 直接++，还是等成为leader再++？
+	rf.votedFor = rf.me
+	rf.persist()
 	latestlog := rf.logs[len(rf.logs)-1]
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -466,6 +499,8 @@ func (rf *Raft) checkTimeoutAndVoteSelf() {
 				if !hasNewLeader.Load() && replies[i].Term > rf.currentTerm {
 					hasNewLeader.Store(true)
 					rf.curLeader = i
+					rf.currentTerm = replies[i].Term
+					rf.persist()
 					return
 				}
 				if replies[i].VoteGranted {
@@ -482,8 +517,9 @@ func (rf *Raft) checkTimeoutAndVoteSelf() {
 	wg.Wait()
 	if !hasNewLeader.Load() && int(count.Load()) > rf.peersCnt/2 {
 		rf.curLeader = rf.me // become leader
+		rf.persist()
 		// rf.currentTerm++
-		// log.Printf("%v leader granted, cur term %v", rf.me, rf.currentTerm)
+		log.Printf("%v leader granted, cur term %v", rf.me, rf.currentTerm)
 	}
 }
 
