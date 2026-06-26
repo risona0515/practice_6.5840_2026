@@ -26,12 +26,19 @@ type (
 	TTermIndex uint32
 	TLogIndex  uint64
 	// TPeerID    uint32
+	TState int
 )
 
 type Log struct {
-	term  TTermIndex
-	index TLogIndex
+	Term  TTermIndex
+	Index TLogIndex
+	Data  any
 }
+
+const (
+	IDLE TState = iota
+	SYNCING
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -46,19 +53,26 @@ type Raft struct {
 
 	curLeader   int
 	peersCnt    int
-	leaderAlive bool
+	leaderAlive bool // 起到定时器的作用。也可以通过记录时间来达到目的
 
 	// Persistent
-	currentTerm TTermIndex
-	votedFor    int
-	logs        []Log
+	currentTerm   TTermIndex
+	votedFor      int
+	logs          []Log
+	firstLogIndex TLogIndex
 
 	// Volatile
+	individualLocks []sync.Mutex
+	peerStates      []TState
+
 	commitIndex TLogIndex
 	lastApplied TLogIndex
 
-	nextIndex  []TLogIndex
-	matchIndex []TLogIndex
+	prevIndexes  []TLogIndex
+	nextIndexes  []TLogIndex
+	matchIndexes []TLogIndex
+
+	appChan chan raftapi.ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -136,13 +150,46 @@ type AppendEntriesArgs struct {
 	LeaderID        int
 	PrevLogIndex    TLogIndex
 	PrevLogTerm     TTermIndex
-	Entries         []int
+	Entries         []Log
 	LeaderCommitIdx TLogIndex
 }
 
 type AppendEntriesReply struct {
 	Term    TTermIndex
 	Success bool
+
+	ConflictTerm           TTermIndex
+	ConflictTermFirstIndex TLogIndex
+	LastTerm               TTermIndex
+	LastIndex              TLogIndex
+}
+
+func (rf *Raft) isConflict(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+
+	// 如果append entries中第一个日志比最新的日志还大
+	// 返回失败，填写自己最新的日志的位置，等待leader重新通知
+	latestLog := rf.logs[len(rf.logs)-1]
+	if args.PrevLogIndex > latestLog.Index {
+		// reply.Success = false
+		reply.LastIndex = latestLog.Index
+		reply.Term = latestLog.Term
+		return true
+	}
+
+	prevLog := rf.logs[args.PrevLogIndex-rf.firstLogIndex]
+	if prevLog.Term != args.PrevLogTerm {
+		// reply.Success = false
+		reply.ConflictTerm = prevLog.Term
+		reply.ConflictTermFirstIndex = rf.commitIndex
+		for idx := prevLog.Index; idx >= rf.firstLogIndex; idx-- {
+			if rf.logs[idx-rf.firstLogIndex].Term != prevLog.Term {
+				reply.ConflictTermFirstIndex = idx + 1
+				break
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -157,9 +204,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// if args.Term > rf.currentTerm {
 	// rf.curLeader = args.LeaderID
 	rf.currentTerm = args.Term
-
-	reply.Success = true
 	reply.Term = rf.currentTerm
+
 	// return
 	// }
 	// 有没有可能同term但多个server发来了append entries？
@@ -172,8 +218,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 	if args.Entries == nil { // keep alive heartbeat
 		// rf.leaderAlive = true
+		if rf.isConflict(args, reply) {
+			reply.Success = false
+		} else {
+			reply.Success = true
+		}
 		return
 	}
+
+	// 如果append entries中最新的日志都比已经commit的小
+	// 感觉这个分支走不进来
+	if rf.commitIndex > args.Entries[len(args.Entries)-1].Index {
+		reply.Success = true
+		return
+	}
+
+	if rf.isConflict(args, reply) {
+		reply.Success = false
+		return
+	}
+
+	// 拼上去
+
+	// 感觉不太可能commit还大于第一个？
+	// startPos := 0
+	// if rf.commitIndex >= args.Entries[startPos].index {
+	// 	startPos = int(rf.commitIndex - args.Entries[startPos].index + 1)
+	// }
+	// startIndex := args.Entries[startPos].index
+	// rf.logs = append(rf.logs[:(startIndex-rf.firstLogIndex)], args.Entries[startPos:]...)
+
+	rf.logs = append(rf.logs[:args.Entries[0].Index], args.Entries...)
+
+	// 然后commit
+	rf.commitIndex = min(args.LeaderCommitIdx, rf.logs[len(rf.logs)-1].Index)
+
+	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -192,8 +272,8 @@ func (rf *Raft) keepalive() {
 	args := AppendEntriesArgs{
 		Term:            rf.currentTerm,
 		LeaderID:        rf.me,
-		PrevLogIndex:    0,
-		PrevLogTerm:     0,
+		PrevLogIndex:    rf.logs[len(rf.logs)-1].Index,
+		PrevLogTerm:     rf.logs[len(rf.logs)-1].Term,
 		Entries:         nil,
 		LeaderCommitIdx: 0,
 	}
@@ -230,6 +310,9 @@ func (rf *Raft) keepalive() {
 					rf.persist()
 					return
 				}
+				if !replies[i].Success {
+					rf.getCommonPosAndRetry(i, &replies[i])
+				}
 				return
 			case <-ctx.Done():
 				return
@@ -240,6 +323,51 @@ func (rf *Raft) keepalive() {
 		}
 	}
 }
+
+// lock outside of this function
+// func (rf *Raft) broadcaster(args []AppendEntriesArgs, replies []AppendEntriesReply) {
+// 	var wg sync.WaitGroup
+// 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+// 	defer cancel()
+
+// 	var hasNewLeader atomic.Bool
+// 	hasNewLeader.Store(false) // 记录是否有新的leader
+
+// 	for i := 0; i < rf.peersCnt; i++ {
+// 		if i == rf.me {
+// 			continue
+// 		}
+// 		wg.Add(1)
+// 		go func(i int) {
+// 			defer wg.Done()
+// 			ch := make(chan bool, 1)
+// 			go func() {
+// 				ok := rf.sendAppendEntries(i, &(args[i]), &(replies[i]))
+// 				ch <- ok
+// 			}()
+// 			select {
+// 			case ok := <-ch:
+// 				if !ok {
+// 					// log.Printf("leader %v send appendentries to %v failed", rf.me, i)
+// 					return
+// 				}
+// 				if !hasNewLeader.Load() && replies[i].Term > rf.currentTerm {
+// 					hasNewLeader.Store(true)
+// 					rf.curLeader = i
+// 					rf.currentTerm = replies[i].Term
+// 					rf.persist()
+// 					return
+// 				}
+// 				return
+// 			case <-ctx.Done():
+// 				return
+// 			}
+// 		}(i)
+// 		if hasNewLeader.Load() {
+// 			break
+// 		}
+// 	}
+// }
 
 // func (rf *Raft) broadcast(args *AppendEntriesArgs) {
 
@@ -261,6 +389,9 @@ func (rf *Raft) keepalive() {
 // 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 // 	defer cancel()
 
+// 	var hasNewLeader atomic.Bool
+// 	hasNewLeader.Store(false) // 记录是否有新的leader
+
 // 	for i := 0; i < rf.peersCnt; i++ {
 // 		if i == rf.me {
 // 			continue
@@ -278,6 +409,7 @@ func (rf *Raft) keepalive() {
 // 				if !ok {
 // 					return
 // 				}
+
 // 				return
 // 			case <-ctx.Done():
 // 				return
@@ -329,8 +461,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateId
 	lastLog := rf.logs[len(rf.logs)-1]
-	upToData := args.LastLogTerm > lastLog.term ||
-		(args.LastLogTerm == lastLog.term && args.LastLogIndex >= lastLog.index)
+	upToData := args.LastLogTerm > lastLog.Term ||
+		(args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
 
 	if canVote && upToData {
 		rf.votedFor = args.CandidateId
@@ -358,9 +490,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// rf.votedFor = math.MaxInt32
 
 	// latestlog := rf.logs[len(rf.logs)-1]
-	// if latestlog.index <= args.LastLogIndex && latestlog.term <= args.LastLogTerm {
+	// if latestlog.Index <= args.LastLogIndex && latestlog.Term <= args.LastLogTerm {
 	// 	log.Printf("%v grant %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-	// 	log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
+	// 	log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.Index, latestlog.Term)
 
 	// 	rf.votedFor = args.CandidateId
 	// 	// rf.currentTerm = args.Term
@@ -370,7 +502,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// } else {
 
 	// 	log.Printf("%v rrreject %v request vote, args term %v, cur term %v\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-	// 	log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.index, latestlog.term)
+	// 	log.Printf("args logid %v logterm %v, me logid %v, logterm %v\n", args.LastLogIndex, args.LastLogTerm, latestlog.Index, latestlog.Term)
 	// 	reply.VoteGranted = false
 	// }
 }
@@ -420,13 +552,125 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	isLeader := rf.curLeader == rf.me
+	// log.Printf("me %v isleader %v curleader %v", rf.me, isLeader, rf.curLeader)
+	if !isLeader {
+		return -1, -1, isLeader
+	}
 
 	// Your code here (3B).
 
-	return index, term, isLeader
+	term := rf.currentTerm
+
+	lastlog := rf.logs[len(rf.logs)-1]
+	index := lastlog.Index + 1
+	newlog := Log{rf.currentTerm, index, command}
+	rf.logs = append(rf.logs, newlog)
+	go rf.broadcastNewLog(index)
+
+	log.Printf("*******Start function print all logs*******")
+	for idx := 0; idx < len(rf.logs); idx++ {
+		log.Printf("me %v, leader %v, log %v %v", rf.me, rf.curLeader, idx, rf.logs[idx])
+	}
+	log.Printf("*******print end******")
+
+	return int(index), int(term), isLeader
+}
+
+func (rf *Raft) broadcastNewLog(index TLogIndex) {
+	_ = index // unreferenced param
+	for i := 0; i < rf.peersCnt; i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.appendNewLog(i)
+	}
+}
+
+func (rf *Raft) waitAndRetryAppendNewLog(server int) {
+	time.Sleep(200 * time.Millisecond)
+	rf.appendNewLog(server)
+}
+
+func (rf *Raft) getCommonPosAndRetry(server int, reply *AppendEntriesReply) {
+	rf.individualLocks[server].Lock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.individualLocks[server].Unlock()
+
+	prevLogIdx := rf.prevIndexes[server]
+	prevLog := rf.logs[prevLogIdx-rf.firstLogIndex]
+
+	if reply.LastIndex < prevLog.Index {
+		if reply.LastIndex < rf.firstLogIndex {
+			// install snapshot
+			// append
+			return
+		} else {
+			// followerLastLog := rf.logs[reply.LastIndex-rf.firstLogIndex]
+			rf.prevIndexes[server] = reply.LastIndex
+			rf.appendNewLog(server)
+			return
+		}
+	}
+
+	conflictTermFirstLog := rf.logs[reply.ConflictTermFirstIndex-rf.firstLogIndex]
+	if conflictTermFirstLog.Term == reply.ConflictTerm {
+		rf.prevIndexes[server] = reply.ConflictTermFirstIndex
+	} else {
+		rf.prevIndexes[server] = reply.ConflictTermFirstIndex - 1
+	}
+	rf.appendNewLog(server)
+
+}
+
+func (rf *Raft) appendNewLog(server int) {
+	rf.individualLocks[server].Lock()
+	defer rf.individualLocks[server].Unlock()
+
+	if rf.peerStates[server] == SYNCING {
+		return
+	}
+	rf.peerStates[server] = SYNCING
+
+	prevLogIdx := rf.prevIndexes[server]
+	prevLog := rf.logs[prevLogIdx]
+	lastLog := rf.logs[len(rf.logs)-1]
+
+	args := AppendEntriesArgs{
+		Term:     lastLog.Term,
+		LeaderID: rf.me,
+	}
+	args.PrevLogIndex = prevLog.Index
+	args.PrevLogTerm = prevLog.Term
+	args.Entries = rf.logs[prevLogIdx+1:]
+	args.LeaderCommitIdx = rf.commitIndex
+
+	reply := AppendEntriesReply{}
+
+	ok := rf.sendAppendEntries(server, &args, &reply)
+
+	if !ok {
+		rf.waitAndRetryAppendNewLog(server)
+	}
+	rf.peerStates[server] = IDLE
+	if !reply.Success {
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.curLeader = server
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+		rf.getCommonPosAndRetry(server, &reply)
+		return
+	}
+
+	rf.prevIndexes[server] = lastLog.Index
 }
 
 func (rf *Raft) checkTimeoutAndVoteSelf() {
@@ -445,8 +689,8 @@ func (rf *Raft) checkTimeoutAndVoteSelf() {
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: latestlog.index,
-		LastLogTerm:  latestlog.term,
+		LastLogIndex: latestlog.Index,
+		LastLogTerm:  latestlog.Term,
 	}
 	replies := make([]RequestVoteReply, rf.peersCnt)
 
@@ -519,6 +763,13 @@ func (rf *Raft) checkTimeoutAndVoteSelf() {
 		rf.curLeader = rf.me // become leader
 		rf.persist()
 		// rf.currentTerm++
+		latestIndex := rf.logs[len(rf.logs)-1].Index
+		for idx := 0; idx < rf.peersCnt; idx++ {
+			if idx == rf.me {
+				continue
+			}
+			rf.prevIndexes[idx] = latestIndex
+		}
 		log.Printf("%v leader granted, cur term %v", rf.me, rf.currentTerm)
 	}
 }
@@ -571,6 +822,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.leaderAlive = true // 初始化为true，等定时器自己超时
 	rf.curLeader = -1
 	rf.logs = make([]Log, 1) // 初始化一个全0的初始log方便RequestVote里统一逻辑
+	rf.individualLocks = make([]sync.Mutex, rf.peersCnt)
+	rf.peerStates = make([]TState, rf.peersCnt)
+	rf.prevIndexes = make([]TLogIndex, rf.peersCnt)
+	rf.nextIndexes = make([]TLogIndex, rf.peersCnt)
+	rf.matchIndexes = make([]TLogIndex, rf.peersCnt)
+	rf.appChan = applyCh
 
 	// Your initialization code here (3A, 3B, 3C).
 

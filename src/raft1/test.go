@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -49,7 +49,11 @@ func newRaftServer(srv IraftServer) *raftServer {
 func (rs *raftServer) entry(i int) (any, bool) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-
+	// log.Printf("*******PRINT LOGS*******")
+	// for idx := 0; idx < len(rs.logs); idx++ {
+	// 	log.Printf("cur idx %v , content %v", idx, rs.logs[idx])
+	// }
+	// log.Printf("*******PRINT LOGS END*******")
 	v, ok := rs.logs[i]
 	return v, ok
 }
@@ -313,7 +317,9 @@ func (ts *Test) one(cmd any, expectedServers int, retry bool) int {
 			if rf != nil {
 				// log.Printf("peer %d Start %v rf %v", starts, cmd, rf)
 				index1, _, ok := rf.Start(cmd)
+				// log.Printf("index1 %v ok %v", index1, ok)
 				if ok {
+					log.Printf("server %v index %v", starts, index1)
 					index = index1
 					break
 				}
@@ -326,6 +332,7 @@ func (ts *Test) one(cmd any, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := ts.nCommitted(index)
+				// log.Printf("get cmd nd %v cmd1 %v, index %v", nd, cmd1, index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
